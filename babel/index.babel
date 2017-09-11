@@ -1,0 +1,577 @@
+/* Imported Libs & Global vars
+** ************************************** */
+const R = R // Ramda
+const axios = axios
+const React = React
+const moment = moment
+const Reselect = Reselect
+const ReactDOM = ReactDOM
+const { connect, Provider } = ReactRedux
+const thunkMiddleware = ReduxThunk.default
+const { createStore, applyMiddleware } = Redux
+const domContainerNode = document.getElementById('react-app')
+
+const DEBUG = false
+const FEED_URL = DEBUG
+  ? 'wss://ws-feed-public.sandbox.gdax.com'
+  : 'wss://ws-feed.gdax.com'
+const API_URL = DEBUG
+  ? 'https://api-public.sandbox.gdax.com'
+  : 'https://api.gdax.com'
+const PRODUCT_IDS = ['BTC-USD', 'BTC-EUR', 'BTC-GBP']
+
+const gdaxApi = axios.create({
+  baseURL: API_URL,
+  headers: {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json'
+  }
+})
+
+
+/* Helper Functions
+** ************************************** */
+const {
+  mapKeysToObject,
+  getNestedValue,
+  wait,
+  toQueryParams,
+  commaify,
+  percentageChange,
+  percentify
+} = Helpers
+
+const {
+  connectStateValue,
+  connectValue,
+  createActionConnector
+} = ReactReduxHelpers
+
+
+/* Action Types, Action Creators, Initial State & Reducers
+** ************************************** */
+const actionTypes = {
+  // META TYPES
+  'SET_ACTIVE_PRODUCT': 'SET_ACTIVE_PRODUCT',
+  // FEED LIFECYLE TYPES
+  'FEED_CONNECT': 'FEED_CONNECT',
+  'FEED_SET_SOCKET': 'FEED_SET_SOCKET',
+  // SOCKET EVENT TYPES
+  'SOCKET_OPEN': 'SOCKET_OPEN',
+  'SOCKET_CLOSE': 'SOCKET_CLOSE',
+  'SOCKET_ERROR': 'SOCKET_ERROR',
+  'SOCKET_MESSAGE': 'SOCKET_MESSAGE',
+  // API REQUEST TYPES
+  'API_PRODUCT_BOOK_REQUEST': 'API_PRODUCT_BOOK_REQUEST',
+  'API_PRODUCT_BOOK_SUCCESS': 'API_PRODUCT_BOOK_SUCCESS',
+  'API_PRODUCT_BOOK_FAILURE': 'API_PRODUCT_BOOK_FAILURE',
+  'API_PRODUCT_STATS_REQUEST': 'API_PRODUCT_STATS_REQUEST',
+  'API_PRODUCT_STATS_SUCCESS': 'API_PRODUCT_STATS_SUCCESS',
+  'API_PRODUCT_STATS_FAILURE': 'API_PRODUCT_STATS_FAILURE',
+  'API_PRODUCT_TICKER_REQUEST': 'API_PRODUCT_TICKER_REQUEST',
+  'API_PRODUCT_TICKER_SUCCESS': 'API_PRODUCT_TICKER_SUCCESS',
+  'API_PRODUCT_TICKER_FAILURE': 'API_PRODUCT_TICKER_FAILURE',
+}
+
+const actionCreators = {
+  setActiveProduct: dispatch => productId =>
+    dispatch({
+      type: actionTypes['SET_ACTIVE_PRODUCT'],
+      payload: { product_id: productId }
+    }),
+  
+  feedConnect: dispatch => payload =>
+    dispatch({type: actionTypes.FEED_CONNECT, payload}),
+  
+  feedSetSocket: dispatch => payload =>
+    dispatch({type: actionTypes.FEED_SET_SOCKET, payload}),
+  
+  socketOpen: dispatch => payload =>
+    dispatch({type: actionTypes.SOCKET_OPEN, payload}),
+  
+  socketClose: dispatch => payload =>
+    dispatch({type: actionTypes.SOCKET_CLOSE, payload}),
+  
+  socketError: dispatch => payload =>
+    dispatch({type: actionTypes.SOCKET_ERROR, payload}),
+  
+  socketMessage: dispatch => payload =>
+    dispatch({type: actionTypes.SOCKET_MESSAGE, payload}),
+  
+  apiProductRequest: dispatch => (productId, endpoint, query = {}) => {
+    dispatch({
+      type: actionTypes['API_PRODUCT_' + endpoint.toUpperCase() + '_REQUEST'],
+      payload: { product_id: productId }
+    })
+    return gdaxApi('products/' + productId + '/' + endpoint + toQueryParams(query))
+      .then(({data}) =>
+        dispatch({
+          type: actionTypes['API_PRODUCT_' + endpoint.toUpperCase() + '_SUCCESS'],
+          payload: R.set(R.lensProp('product_id'), productId, data)
+        }))
+      .catch(error =>
+        dispatch({
+          type: actionTypes['API_PRODUCT_' + endpoint.toUpperCase() + '_FAILURE'],
+          payload: error
+        }))
+  }
+}
+
+const initialState = {
+  feed: {
+    error: null,
+    socket: null,
+    readyState: 3 // 0 = CONNECTING, 1 = OPEN, 2 = CLOSING, 3 = CLOSED
+  },
+  activeProductId: PRODUCT_IDS[0],
+  productsById: mapKeysToObject(PRODUCT_IDS, id => ({
+    id,
+    baseCurrency: id.split('-')[0],
+    quoteCurrency: id.split('-')[1],
+    stats: {
+      lastTrade: 0,
+      open: 0,
+      '24HrHigh': 0,
+      '24HrLow': 0,
+      '24HrVolume': 0
+    },
+    messageQueue: [],
+    hasSnapshot: false,
+    ordersById: {},
+    sizesByPrice: {}
+  }))
+}
+
+
+/* Lens & Selectors
+** ************************************** */
+const feedLens = R.lensProp('feed')
+const errorLens = R.compose(feedLens, R.lensProp('error'))
+const socketLens = R.compose(feedLens, R.lensProp('socket'))
+const readyStateLens = R.compose(feedLens, R.lensProp('readyState'))
+const activeProductIdLens = R.lensProp('activeProductId')
+
+const sideLens = R.lensProp('side')
+const sizeLens = R.lensProp('size')
+const priceLens = R.lensProp('price')
+const remainingSizeLens = R.lensProp('remaining_size')
+
+const productsByIdLens = R.lensProp('productsById')
+
+const createProductLensHelper = productId => (lensPathArray = []) =>
+  R.compose(
+    R.lensPath,
+    R.concat(['productsById', productId])
+  )(lensPathArray)
+
+const productLensHelpersById = mapKeysToObject(PRODUCT_IDS, createProductLensHelper)
+
+// Helper for applying messages in real-time
+const applyMessageToStats = (
+  message,
+  productId = message.product_id,
+  productLensHelper = productLensHelpersById[productId]
+) => R.set(
+  productLensHelper(['stats', 'lastTrade']),
+  +message.price
+)
+
+const applyMessageToError = message =>
+  R.set(errorLens, message)
+
+const productHasSnapshot = (
+  message,
+  productId = message.product_id,
+  productLensHelper = productLensHelpersById[productId]
+) => R.view(productLensHelper(['hasSnapshot']))
+
+const applyMessageToOrders = (
+  message,
+  productId = message.product_id,
+  productLensHelper = productLensHelpersById[productId]
+) => state => {
+  const orderLens = productLensHelper(['ordersById', message.order_id])
+  const order = R.view(orderLens, state) || {}
+  switch (message.type) {
+//     case ('open') :
+//       // console.log('open', message)
+//       // return R.set(
+//       //   orderLens,
+//       //   R.merge(),
+//       //   state
+//       // )
+//     case ('done') :
+    
+//     case ('match') :
+    
+//     case ('change') :
+    
+    default :
+      return state
+  }
+}
+
+const enqueueMessage = (
+  message,
+  productId = message.product_id,
+  productLensHelper = productLensHelpersById[productId]
+) => state => R.set(
+  productLensHelper(['messageQueue']),
+  R.prepend(message, R.view(productLensHelper(['messageQueue']), state)),
+  state
+)
+// ) => R.set(
+//   productLensHelper(['messageQueue']),
+//   R.prepend(message, R.view(productLensHelper(['messageQueue'])))    
+// )
+
+
+// Root Reducer
+const rootReducer = (state = initialState, {type, payload = {}}) => {  
+  const productId = payload.product_id || payload.productId
+  const error = payload.err || payload.error || payload
+  const productLensHelper = productLensHelpersById[productId]
+  
+  switch (type) {
+    case (actionTypes.SET_ACTIVE_PRODUCT):
+      return R.set(activeProductIdLens, productId, state)
+
+    case (actionTypes.FEED_CONNECT):
+      return R.set(readyStateLens, 0, state)
+    
+    case (actionTypes.FEED_SET_SOCKET):
+      return R.set(socketLens, payload, state)
+    
+    case (actionTypes.SOCKET_OPEN):
+      return R.set(readyStateLens, 1, state)
+      
+    case (actionTypes.SOCKET_CLOSE):
+      return R.set(readyStateLens, 3, state)
+      
+    case (actionTypes.SOCKET_ERROR):
+      return R.set(errorLens, error, state)
+      
+    case (actionTypes.SOCKET_MESSAGE):
+      return R.compose(
+        (payload.type === 'match' ? applyMessageToStats(payload) : R.tap(R.always)),
+        (payload.type === 'error' ? applyMessageToError(payload) : R.tap(R.always)),
+        R.ifElse(productHasSnapshot(payload), applyMessageToOrders(payload), enqueueMessage(payload))
+      )(state)
+
+    case (actionTypes.API_PRODUCT_STATS_SUCCESS):
+      return R.compose(
+        R.set(productLensHelper(['stats', 'open']), +payload.open), // what is open? -24Hr?
+        R.set(productLensHelper(['stats', '24HrHigh']), +payload.high),
+        R.set(productLensHelper(['stats', '24HrLow']), +payload.low),
+        R.set(productLensHelper(['stats', '24HrVolume']), Math.round(+payload.volume))
+      )(state)
+      
+    case (actionTypes.API_PRODUCT_TICKER_SUCCESS):
+      return R.compose(
+        R.set(productLensHelper(['stats', 'lastTrade']), +payload.price),
+        R.set(productLensHelper(['stats', '24HrVolume']), Math.round(+payload.volume))
+      )(state)
+      
+    case (actionTypes.API_PRODUCT_BOOK_SUCCESS):
+      return R.compose(
+        // applySnapshotToMarketData(payload),
+        // applySnapshotToOrdersData(payload),
+        R.set(productLensHelper(['hasSnapshot']), true)
+      )(state)
+      
+    default:
+      return state
+  }
+}
+
+
+/* Feed Data
+** ************************************** */
+const feedUrl = FEED_URL
+const feedEventHandlersData = {
+  onOpen: function (e, dispatch) {
+    actionCreators.socketOpen(dispatch)(this.readyState)
+    // Send subscribe handshake
+    this.send(JSON.stringify({type: 'subscribe', product_ids: PRODUCT_IDS}))
+    // Turn on heartbeat
+    // this.send(JSON.stringify({type: 'heartbeat', on: true}))
+  },
+  onClose: function (e, dispatch) {
+    actionCreators.socketClose(dispatch)(this.readyState)
+  },
+  onError: function (err, dispatch) {
+    actionCreators.socketError(dispatch)(err)
+  },
+  onMessage: function (e, dispatch) {
+    actionCreators.socketMessage(dispatch)(JSON.parse(e.data))
+  }
+}
+
+
+/* Redux Middleware & Store
+** ************************************** */
+const thunk = thunkMiddleware
+
+const logger = window.reduxLogger
+  ? window.reduxLogger({
+      diff: true,
+      collapsed: true,
+      predicate: (getState, action) =>
+        action.type !== actionTypes.SOCKET_MESSAGE &&
+        !R.contains('REQUEST', action.type) &&
+        !R.contains('SUCCESS', action.type)
+    })
+  : ({dispatch, getState}) =>
+      next => action => {
+        console.log({'Action Type': action.type, 'Updated State': getState()})
+        return next(action) }
+
+// returns a function that takes a socekt instance and a dispatch
+const createSocketEventHandler = eventHandler => (socket, dispatch) => event =>
+  typeof eventHandler === 'function'
+  ? eventHandler.bind(socket)(event, dispatch)
+  : null
+
+// Wrap websocket event handlers with redux functionality
+const createSocketMiddleware = (socketUrl, {onOpen, onClose, onError, onMessage}, setSocketActionCreator) =>
+  ({dispatch, getState}) => next => action => {
+    if (action.type === actionTypes.FEED_CONNECT) {
+      const {feed: {socket}} = getState()
+      if (socket !== null)
+        socket.close()
+      const newSocket = new WebSocket(socketUrl)
+      newSocket.onopen = createSocketEventHandler(onOpen)(newSocket, dispatch)
+      newSocket.onclose = createSocketEventHandler(onClose)(newSocket, dispatch)
+      newSocket.onerror = createSocketEventHandler(onError)(newSocket, dispatch)
+      newSocket.onmessage = createSocketEventHandler(onMessage)(newSocket, dispatch)
+      setSocketActionCreator(dispatch)(newSocket)
+    } else {
+      return next(action)
+    }        
+  }
+
+const socket = createSocketMiddleware(feedUrl, feedEventHandlersData, actionCreators.feedSetSocket)
+
+const store = createStore(
+  rootReducer,
+  initialState,
+  applyMiddleware(thunk, logger, socket)
+)
+
+
+/* Connector Creators & Providers -- connecting functions for decorating Containers
+** ************************************** */
+const connectAction = createActionConnector(actionCreators)
+
+const withLifecycle = lifecycleMethodsData => Component =>
+  React.createClass({
+    ...lifecycleMethodsData,
+    render () {
+      return <Component {...this.props} /> } })
+
+
+/* Displays -- stateless or "dumb" components
+** ************************************** */
+const Heading = ({children}) =>
+  <h1 className='heading'>{children}</h1>
+
+const Title = ({children}) =>
+  <p className='title'>{children}</p>
+
+const Subtitle = ({children}) =>
+  <p className='subtitle'>{children}</p>
+
+const ProductSelector = ({activeProductId, productIds, setActiveProduct}) =>
+  <ul className='product-selector'>
+    { productIds.map(productId =>
+        <li
+          key={productId}
+          className={
+            'product-select-btn ' + 
+            (productId === activeProductId ? 'active' : 'inactive')
+          }
+          onClick={setActiveProduct.bind(null, productId)}
+        >{productId}</li> )}
+  </ul>
+
+const Percentage = ({initial, current}) => {
+  const percent = percentageChange(initial, current) || 0
+  const color = percent >= 0 ? 'green' : 'red'
+  return <span className={'percent ' + color}>{percentify(percent)}</span>
+}
+
+const PriceDetail = ({price, unit}) =>
+  <div className='price detail'>
+    <Title>{commaify(price, true) + ' ' + unit}</Title>
+    <Subtitle>Last trade price</Subtitle>      
+  </div>
+
+const PercentChangeDetail = ({initial, current}) =>
+  <div className='price-change detail'>
+    <Title><Percentage initial={initial} current={current} /></Title>
+    <Subtitle>24 hour price</Subtitle>
+  </div>
+
+const VolumeDetail = ({volume, unit}) =>
+  <div className='24hr-volume detail'>
+    <Title>{commaify(volume) + ' ' + unit}</Title>
+    <Subtitle>24 hour volume</Subtitle>
+  </div>
+
+const OrderItem = ({price, size, numOrders}) =>
+  <li className='order-item'>
+    <label>${commaify(price)}</label>
+    <label> Size: {size}</label>
+    <label> Num Orders: {numOrders}</label>
+  </li>
+
+const OrderSheet = ({side, orders}) =>
+  <div className='order-sheet flex-item'>
+    <Title>{side}</Title>
+    <ul className='order-list'>
+      { orders.map(order => {
+          const [price, size, orderId] = order
+          const props = {price, size, orderId}
+          return <OrderItem key={orderId} {...props} />
+      })}
+    </ul>
+  </div>
+
+const Book = ({bids, asks}) =>
+  <div className='order-book flex-container'>
+    {/* <OrderSheet side='buy' orders={bids} /> */}
+    {/* <OrderSheet side='sell' orders={asks} /> */}
+  </div>
+
+const ProductDetails = ({product: {id, baseCurrency, quoteCurrency, stats, book}}) =>
+  <div className='product-details'>
+    <PriceDetail price={stats.lastTrade} unit={quoteCurrency} />
+    <PercentChangeDetail initial={stats.open} current={stats.lastTrade} />
+    <VolumeDetail volume={stats['24HrVolume']} unit={baseCurrency} />
+    <Book {...book} />
+  </div>
+
+const FeedStatus = ({readyState}) =>
+  <div className='feed-state'>
+    Feed Status: {(_ => {
+      switch (readyState) {
+        case (0) : return <span className='yellow'>Connecting</span>
+        case (1) : return <span className='green'>Open</span>
+        default  : return <span className='red'>Closed</span>
+      }
+    })()}
+  </div>
+
+const ErrorMessage = ({error}) =>
+  <div className='error-message'>
+    Error Message: {error
+      ? <span className='red'>{error || error.message}</span>
+      : <span className='green'>None</span>
+    }
+  </div>
+
+const Diagnostics = ({readyState, error}) =>
+  <div className='diagnostics'>
+    <Title>Diagnostics</Title>
+    <FeedStatus readyState={readyState} />
+    <ErrorMessage error={error} />
+  </div>
+
+const StateViewer = ({state = {}}) =>
+  <Highlight clasName='json'>
+    {JSON.stringify(state, null, 2)}
+  </Highlight>
+
+
+/* Containers -- decorated (stateful) or "smart" components
+** ************************************** */
+const CurrProductSelector = R.compose(
+  connectStateValue('activeProductId'),
+  connectValue(PRODUCT_IDS, 'productIds'),
+  connectAction('setActiveProduct')
+)(ProductSelector)
+
+const CurrActiveProduct = R.compose(
+  connectStateValue('activeProductId', 'product', (productId, state) =>
+    R.view(productLensHelpersById[productId](), state) )
+)(ProductDetails)
+
+const CurrDiagnostics = R.compose(
+  connectStateValue('feed.readyState'),
+  connectStateValue('feed.error')
+)(Diagnostics)
+
+const idLens = R.lensProp('id')
+const baseCurrencyLens = R.lensProp('baseCurrency')
+const quoteCurrencyLens = R.lensProp('quoteCurrency')
+const statsLens = R.lensProp('stats')
+
+const CurrActiveProductStateViewer = R.compose(
+  connectStateValue('activeProductId', 'state', (productId, state) =>
+    R.pipe(
+      R.set(idLens, R.view(productLensHelpersById[productId](['id']), state)),
+      R.set(baseCurrencyLens, R.view(productLensHelpersById[productId](['baseCurrency']), state)),
+      R.set(quoteCurrencyLens, R.view(productLensHelpersById[productId](['quoteCurrency']), state)),
+      R.set(statsLens, R.view(productLensHelpersById[productId](['stats']), state)),
+    )({})
+  )
+)(StateViewer)
+
+
+/* Main Component & App Container
+** ************************************** */
+const Main = props =>
+  <main>
+    <Heading>GDAX</Heading>
+    <CurrProductSelector />
+    <CurrActiveProduct />
+    <CurrDiagnostics />
+  </main>
+
+const App = withLifecycle({
+  // connect feed and make api requests on componentWillMount
+  componentWillMount: _ => {
+    const {apiProductRequest, feedConnect} = actionCreators
+    const dayDuration =  moment.duration(24, 'hours') // moment duration object
+    const level = 3 // book response detail: 1 = Only the best bid and ask, 2 = Top 50 bids and asks (aggregated), 3 = Full order book (non aggregated)
+
+    const pollingInterval = 2000
+    let pollingIndex = 0
+    
+    // polling helper function
+    const pollProducts = (withTicker = false) => {
+      const productId = PRODUCT_IDS[pollingIndex]
+      const end = moment().subtract(dayDuration).toISOString()
+      const start = moment(end).subtract(dayDuration).toISOString()
+      pollingIndex = ++pollingIndex % PRODUCT_IDS.length // increment index
+      return axios.all([
+        apiProductRequest(store.dispatch)(productId, 'stats'),
+        // flag to only use with ticker on initial request
+        withTicker ? apiProductRequest(store.dispatch)(productId, 'ticker') : undefined
+      ])
+    }
+    
+    const pollProductsWithTicker = pollProducts.bind(null, true)
+    
+    // first fire off initial polling requests
+    PRODUCT_IDS.forEach(pollProductsWithTicker)
+    
+    // now wait a second to respect api rate limit and connect to the websocket feed
+    wait(1000).then(_ => 
+      feedConnect(store.dispatch)() )
+
+    // wait again and request product order books
+    wait(2000).then(_ => 
+      axios.all(PRODUCT_IDS.map(productId =>
+        apiProductRequest(store.dispatch)(productId, 'book', {level})) ))
+    
+    // finally, start polling interval that requests 24Hr stats for each product
+    wait(3000).then(_ =>
+      setInterval(pollProducts, pollingInterval) )
+  }
+})(Main)
+
+ReactDOM.render(
+  <Provider store={store}><App /></Provider>,
+  domContainerNode
+)
